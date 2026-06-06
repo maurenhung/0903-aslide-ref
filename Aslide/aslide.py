@@ -73,12 +73,13 @@ class Slide:
 
     def _resolve_slide_family(self) -> str:
         family = cast(str, self.registry_entry.slide_family)
-        if family not in RUNTIME_CLASSIFIED_FAMILIES:
-            return family
 
         classify = getattr(self.backend, "classify_slide_family", None)
         if callable(classify):
             return cast(str, classify())
+
+        if family not in RUNTIME_CLASSIFIED_FAMILIES:
+            return family
 
         if family != "qptiff":
             return family
