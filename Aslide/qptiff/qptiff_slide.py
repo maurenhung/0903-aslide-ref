@@ -59,6 +59,7 @@ class QptiffSlide(AbstractSlide):
             (level.shape[2], level.shape[1]) for level in self._series.levels
         )
         self._level_downsamples = self._calculate_downsamples()
+        self._mpp = _extract_tiff_mpp(self._series.pages[0])
 
         # Set format for compatibility
         self.format = os.path.splitext(os.path.basename(filename))[-1]
@@ -124,19 +125,10 @@ class QptiffSlide(AbstractSlide):
     @property
     def mpp(self) -> Optional[float]:
         """Microns per pixel"""
-        # Try to get from series metadata if available
-        # qptifffile usually stores resolution in metadata
-        try:
-            if (
-                self._series is not None
-                and hasattr(self._series, "axes")
-                and "X" in self._series.axes
-            ):
-                # This depends on qptifffile implementation
-                pass
-        except:
-            pass
-        return None
+        if self._mpp is None:
+            return None
+        mpp_x, mpp_y = self._mpp
+        return (mpp_x + mpp_y) / 2
 
     @property
     def magnification(self) -> Optional[float]:
@@ -161,6 +153,11 @@ class QptiffSlide(AbstractSlide):
             props[f"openslide.level[{i}].width"] = str(w)
             props[f"openslide.level[{i}].height"] = str(h)
             props[f"openslide.level[{i}].downsample"] = str(self._level_downsamples[i])
+
+        if self._mpp is not None:
+            mpp_x, mpp_y = self._mpp
+            props["openslide.mpp-x"] = str(mpp_x)
+            props["openslide.mpp-y"] = str(mpp_y)
 
         return props
 
@@ -335,3 +332,33 @@ class QptiffSlide(AbstractSlide):
             downsamples.append(downsample)
 
         return tuple(downsamples)
+
+
+def _extract_tiff_mpp(page: Any) -> Optional[Tuple[float, float]]:
+    x_resolution = _resolution_value(page.tags.get("XResolution"))
+    y_resolution = _resolution_value(page.tags.get("YResolution"))
+    if not x_resolution or not y_resolution:
+        return None
+
+    unit_tag = page.tags.get("ResolutionUnit")
+    unit = int(unit_tag.value) if unit_tag is not None else 2
+    if unit == 2:
+        microns_per_unit = 25400.0
+    elif unit == 3:
+        microns_per_unit = 10000.0
+    else:
+        return None
+
+    return (microns_per_unit / x_resolution, microns_per_unit / y_resolution)
+
+
+def _resolution_value(tag: Any) -> Optional[float]:
+    if tag is None:
+        return None
+    value = tag.value
+    if isinstance(value, tuple) and len(value) == 2:
+        numerator, denominator = value
+        if denominator == 0:
+            return None
+        return float(numerator) / float(denominator)
+    return float(value)
