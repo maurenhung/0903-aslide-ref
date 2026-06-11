@@ -300,6 +300,11 @@ def build_default_registry() -> FormatRegistry:
             availability_check=lambda: (
                 _module_available("bioformats") and _module_available("javabridge")
             ),
+            capabilities=BackendCapabilities(
+                has_associated_images=False,
+                supports_biomarkers=True,
+                requires_explicit_channel_read=True,
+            ),
         )
     )
     new_registry.register(

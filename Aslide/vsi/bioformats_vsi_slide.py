@@ -19,7 +19,60 @@ except ImportError:
 
 from openslide import AbstractSlide
 
+from ..errors import (
+    MissingDefaultBiomarkerError,
+    UnknownBiomarkerError,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _select_largest_image_index(ome: Any) -> int:
+    best_index = 0
+    best_area = -1
+    for index in range(ome.image_count):
+        pixels = ome.image(index).Pixels
+        area = int(pixels.SizeX) * int(pixels.SizeY)
+        if area > best_area:
+            best_index = index
+            best_area = area
+    return best_index
+
+
+def _channel_metadata_name(channel: Any) -> Optional[str]:
+    for attr in ("Name", "Fluor"):
+        value = getattr(channel, attr, None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _build_biomarker_map(pixels: Any) -> Dict[str, int]:
+    biomarker_map: Dict[str, int] = {}
+    size_c = int(getattr(pixels, "SizeC", 0) or 0)
+
+    for index in range(size_c):
+        try:
+            channel = pixels.Channel(index)
+        except Exception:
+            channel = None
+        if channel is not None:
+            name = _channel_metadata_name(channel)
+            if name and name not in biomarker_map:
+                biomarker_map[name] = index
+
+    for index in range(size_c):
+        alias = f"channel_{index}"
+        if alias not in biomarker_map:
+            biomarker_map[alias] = index
+
+    return biomarker_map
+
+
+def _array_to_image(img_array: np.ndarray) -> Image.Image:
+    if len(img_array.shape) == 3:
+        return Image.fromarray(img_array)
+    return Image.fromarray(img_array, mode="L")
 
 
 class BioFormatsVsiSlide(AbstractSlide):
@@ -38,6 +91,8 @@ class BioFormatsVsiSlide(AbstractSlide):
         self._ome = None
         self._image_reader = None
         self._java_started = False
+        self._main_series = 0
+        self._biomarker_to_channel: Dict[str, int] = {}
 
         # Start Java VM if not already started
         if not _javabridge.get_env():
@@ -62,9 +117,10 @@ class BioFormatsVsiSlide(AbstractSlide):
         if self._ome is None or self._ome.image_count == 0:
             raise ValueError("No images found in VSI file")
 
-        # Use the first (main) image
-        main_image = self._ome.image(0)
+        self._main_series = _select_largest_image_index(self._ome)
+        main_image = self._ome.image(self._main_series)
         pixels = main_image.Pixels
+        self._biomarker_to_channel = _build_biomarker_map(pixels)
 
         # Basic dimensions
         self._level_count = 1  # Bio-Formats handles pyramid levels internally
@@ -98,6 +154,7 @@ class BioFormatsVsiSlide(AbstractSlide):
         self._properties = {
             "openslide.vendor": "Olympus",
             "openslide.comment": "cellSens VSI format (Bio-Formats)",
+            "bioformats.main.series": str(self._main_series),
         }
 
         if self._mpp_x and self._mpp_y:
@@ -112,6 +169,24 @@ class BioFormatsVsiSlide(AbstractSlide):
         self._properties["bioformats.size.c"] = str(pixels.SizeC)
         self._properties["bioformats.size.z"] = str(pixels.SizeZ)
         self._properties["bioformats.size.t"] = str(pixels.SizeT)
+        if self._biomarker_to_channel:
+            self._properties["vsi.biomarkers"] = ",".join(self._biomarker_to_channel)
+            self._properties["vsi.biomarker-count"] = str(len(self._biomarker_to_channel))
+
+    def classify_slide_family(self) -> str:
+        return "multiplex" if self._biomarker_to_channel else "brightfield"
+
+    def list_biomarkers(self) -> List[str]:
+        return list(self._biomarker_to_channel)
+
+    def get_biomarkers(self) -> List[str]:
+        return self.list_biomarkers()
+
+    def get_default_display_biomarker(self) -> str:
+        biomarkers = self.list_biomarkers()
+        if not biomarkers:
+            raise MissingDefaultBiomarkerError("VSI slide does not define biomarkers")
+        return biomarkers[0]
 
     @property
     def level_count(self) -> int:
@@ -197,22 +272,59 @@ class BioFormatsVsiSlide(AbstractSlide):
                 raise RuntimeError("Bio-Formats reader is closed")
 
             img_array = self._image_reader.read(
-                c=0, z=0, t=0, series=0, rescale=False, XYWH=(x, y, width, height)
+                c=0,
+                z=0,
+                t=0,
+                series=self._main_series,
+                rescale=False,
+                XYWH=(x, y, width, height),
             )
 
-            # Convert to PIL Image
-            if len(img_array.shape) == 3:
-                # RGB image
-                return Image.fromarray(img_array)
-            else:
-                # Grayscale image
-                return Image.fromarray(img_array, mode="L")
+            return _array_to_image(img_array)
 
         except Exception as e:
             logger.error(f"Failed to read region {location} at level {level}: {e}")
             # Return a placeholder image
             placeholder = np.zeros((height, width, 3), dtype=np.uint8)
             return Image.fromarray(placeholder)
+
+    def read_biomarker_region(
+        self,
+        location: Tuple[int, int],
+        level: int,
+        size: Tuple[int, int],
+        biomarker: str,
+    ) -> Image.Image:
+        if level != 0:
+            raise ValueError("Bio-Formats VSI reader only supports level 0")
+        if biomarker not in self._biomarker_to_channel:
+            raise UnknownBiomarkerError(
+                f"Biomarker '{biomarker}' not found. Available: {self.list_biomarkers()}"
+            )
+        if self._image_reader is None:
+            raise RuntimeError("Bio-Formats reader is closed")
+
+        x, y = location
+        width, height = size
+        channel = self._biomarker_to_channel[biomarker]
+        img_array = self._image_reader.read(
+            c=channel,
+            z=0,
+            t=0,
+            series=self._main_series,
+            rescale=False,
+            XYWH=(x, y, width, height),
+        )
+        return _array_to_image(img_array)
+
+    def read_region_biomarker(
+        self,
+        location: Tuple[int, int],
+        level: int,
+        size: Tuple[int, int],
+        biomarker: str,
+    ) -> Image.Image:
+        return self.read_biomarker_region(location, level, size, biomarker)
 
     def get_best_level_for_downsample(self, downsample: float) -> int:
         """Get the best level for a given downsample factor."""
