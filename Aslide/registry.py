@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import importlib
 import inspect
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator as OpenSlideDeepZoomGenerator
@@ -15,6 +15,8 @@ from .capabilities import BackendCapabilities
 BackendFactory = Callable[[], type[Any]] | type[Any]
 AvailabilityCheck = Callable[[], bool]
 ProbeCheck = Callable[[str], bool]
+
+_OPENSLIDE_TIFF_EXTENSIONS: Final = (".tif", ".tiff")
 
 
 def _load_attr(module_name: str, attribute_name: str) -> type[Any]:
@@ -28,6 +30,13 @@ def _module_available(module_name: str) -> bool:
     except Exception:
         return False
     return True
+
+
+def _is_openslide_candidate(path: str) -> bool:
+    extension = Path(path).suffix.lower()
+    if extension not in _OPENSLIDE_TIFF_EXTENSIONS:
+        return True
+    return OpenSlide.detect_format(path) is not None
 
 
 @dataclass(frozen=True)
@@ -401,6 +410,8 @@ def build_default_registry() -> FormatRegistry:
             extensions=(
                 ".svs",
                 ".svslide",
+                ".tif",
+                ".tiff",
                 ".ndpi",
                 ".vms",
                 ".vmu",
@@ -409,6 +420,7 @@ def build_default_registry() -> FormatRegistry:
             ),
             slide_backend=OpenSlide,
             deepzoom_backend=OpenSlideDeepZoomGenerator,
+            probe=_is_openslide_candidate,
             capabilities=BackendCapabilities(
                 has_associated_images=True, has_deepzoom=True
             ),
